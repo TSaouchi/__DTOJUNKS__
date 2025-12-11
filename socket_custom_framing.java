@@ -1,74 +1,45 @@
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.channels.SocketChannel;
+import reactor.core.publisher.Mono;
+import reactor.netty.Connection;
+import reactor.netty.tcp.TcpClient;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import java.nio.charset.StandardCharsets;
-import java.util.Map;
+import java.util.List;
 
-public class SimpleSyncNioClient {
+public class ReactorSocketClient {
 
-    private static final byte[] BEGIN = "BEGIN".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] END   = "END".getBytes(StandardCharsets.US_ASCII);
+    public Mono<String> sendMessage(String host, int port, List<String> keys) {
 
-    public static String sendAndReceive(String host, int port, Map<String, Object> payload) throws IOException {
+        TcpClient client = TcpClient.create()
+                .host(host)
+                .port(port);
 
-        try (SocketChannel channel = SocketChannel.open()) {
-            channel.configureBlocking(true);
-            channel.connect(new InetSocketAddress(host, port));
+        return client.connect()
+                .flatMap(conn -> {
 
-            // --- prepare payload ---
-            byte[] payloadBytes = serializeAsciiMap(payload);
+                    ByteBuf frame = buildFrame(keys, conn.outbound().alloc());
 
-            ByteBuffer beginBuf  = ByteBuffer.wrap(BEGIN);
-            ByteBuffer lenBuf    = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
-            ByteBuffer countBuf  = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN);
-            ByteBuffer payloadBuf = ByteBuffer.wrap(payloadBytes);
-            ByteBuffer endBuf    = ByteBuffer.wrap(END);
-
-            lenBuf.putInt(payloadBytes.length).flip();
-            countBuf.putInt(payload.size()).flip();
-
-            // --- write ---
-            writeFully(channel, beginBuf);
-            writeFully(channel, lenBuf);
-            writeFully(channel, countBuf);
-            writeFully(channel, payloadBuf);
-            writeFully(channel, endBuf);
-
-            // --- read response ---
-            return readResponse(channel);
-        }
+                    return conn.outbound()
+                            .sendObject(frame)
+                            .then()
+                            .thenMany(conn.inbound().receive().aggregate().asString(StandardCharsets.US_ASCII))
+                            .single()
+                            .doFinally(s -> conn.dispose());
+                });
     }
 
-    /**
-     * Reads until the server closes the connection.
-     * If your protocol uses END markers, we can modify this.
-     */
-    private static String readResponse(SocketChannel channel) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(4096);
+    private ByteBuf buildFrame(List<String> keys, ByteBufAllocator alloc) {
         StringBuilder sb = new StringBuilder();
+        keys.forEach(k -> sb.append(k).append("\n"));
 
-        while (true) {
-            buffer.clear();
-            int read = channel.read(buffer);
-            if (read == -1) break;  // server closed socket
-            buffer.flip();
-            sb.append(StandardCharsets.US_ASCII.decode(buffer));
-        }
+        byte[] payload = sb.toString().getBytes(StandardCharsets.US_ASCII);
 
-        return sb.toString();
-    }
-
-    private static byte[] serializeAsciiMap(Map<String, Object> map) {
-        StringBuilder sb = new StringBuilder(map.size() * 16);
-        map.forEach((k, v) -> sb.append(k).append("=").append(v).append("\n"));
-        return sb.toString().getBytes(StandardCharsets.US_ASCII);
-    }
-
-    private static void writeFully(SocketChannel channel, ByteBuffer buf) throws IOException {
-        while (buf.hasRemaining()) {
-            channel.write(buf);
-        }
+        ByteBuf buf = alloc.buffer();
+        buf.writeBytes("BEGIN".getBytes(StandardCharsets.US_ASCII));
+        buf.writeInt(payload.length);
+        buf.writeInt(keys.size());
+        buf.writeBytes(payload);
+        buf.writeBytes("END".getBytes(StandardCharsets.US_ASCII));
+        return buf;
     }
 }
