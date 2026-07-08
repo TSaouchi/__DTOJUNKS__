@@ -1,69 +1,81 @@
+import logging
+from datetime import timedelta
+
+import httpx
+from aiobreaker import CircuitBreaker, CircuitBreakerListener
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+
+class BreakerLogger(CircuitBreakerListener):
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+        self._last_exc = None
+
+    def failure(self, cb, exc):
+        self._last_exc = exc
+        self._logger.warning(
+            "breaker failure %s/%s recorded: %r", cb.fail_counter, cb.fail_max, exc
+        )
+
+    def success(self, cb):
+        self._last_exc = None
+
+    def state_change(self, cb, old_state, new_state):
+        self._logger.info("breaker %s -> %s", old_state.state, new_state.state)
+        if type(new_state).__name__ == "CircuitOpenState":
+            self._logger.error(
+                "breaker OPEN — %s consecutive failures reached fail_max=%s. "
+                "Last error: %r. Will allow a trial call again after %s.",
+                cb.fail_counter, cb.fail_max, self._last_exc, cb.timeout_duration,
+            )
+
+
 class ResilientTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
+        logger: logging.Logger,
         transport: httpx.AsyncBaseTransport | None = None,
         fail_max: int = 5,
         timeout_duration: timedelta = timedelta(seconds=30),
     ):
+        self._logger = logger
         self._transport = transport or httpx.AsyncHTTPTransport()
-        self._breaker_logger = BreakerLogger()
+
+        self._breaker_logger = BreakerLogger(logger)
         self._breaker = CircuitBreaker(
             fail_max=fail_max,
             timeout_duration=timeout_duration,
             listeners=[self._breaker_logger],
         )
-    # ... rest unchanged
 
+        # Built once, reused for every call — no decorator needed.
+        self._retryer = AsyncRetrying(
+            retry=retry_if_exception_type(httpx.HTTPError),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=8),
+            reraise=True,
+            before_sleep=self._log_retry,  # bound method, self is already captured
+        )
 
-import asyncio
-from datetime import timedelta
+    def _log_retry(self, retry_state) -> None:
+        exc = retry_state.outcome.exception()
+        self._logger.warning(
+            "retry attempt %s failed (%r); retrying in %.1fs",
+            retry_state.attempt_number,
+            exc,
+            retry_state.next_action.sleep,
+        )
 
-import httpx
-
-
-class FlakyTransport(httpx.AsyncBaseTransport):
-    """Fails the first `fail_times` calls, or always if `always_fail=True`."""
-
-    def __init__(self, fail_times: int = 0, always_fail: bool = False):
-        self.fail_times = fail_times
-        self.always_fail = always_fail
-        self.calls = 0
+    async def _retry_execute(self, request: httpx.Request) -> httpx.Response:
+        return await self._retryer(self._transport.handle_async_request, request)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self.calls += 1
-        if self.always_fail or self.calls <= self.fail_times:
-            raise httpx.ConnectTimeout("simulated failure", request=request)
-        return httpx.Response(200, request=request)
+        return await self._breaker.call_async(self._retry_execute, request)
 
-
-async def main():
-    request = httpx.Request("GET", "https://example.com")
-
-    print("=== 1) Transient failure — retry should recover it ===")
-    t = ResilientTransport(transport=FlakyTransport(fail_times=2))
-    resp = await t.handle_async_request(request)
-    print(f"-> got {resp.status_code}\n")
-
-    print("=== 2) Persistent failure — breaker should trip (fail_max=2 for speed) ===")
-    t = ResilientTransport(
-        transport=FlakyTransport(always_fail=True),
-        fail_max=2,
-        timeout_duration=timedelta(seconds=2),
-    )
-    for i in range(3):
-        try:
-            await t.handle_async_request(request)
-        except Exception as e:
-            print(f"call {i + 1} -> {type(e).__name__}: {e}")
-
-    print("\n=== 3) Waiting past timeout_duration, breaker should try a trial call ===")
-    await asyncio.sleep(2.5)
-    try:
-        await t.handle_async_request(request)
-    except Exception as e:
-        print(f"trial call -> {type(e).__name__}: {e}")
-
-    await t.aclose()
-
-
-asyncio.run(main())
+    async def aclose(self):
+        await self._transport.aclose()
