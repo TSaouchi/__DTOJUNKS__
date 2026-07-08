@@ -13,7 +13,6 @@ from tenacity import (
 class ResilientTransport(httpx.AsyncBaseTransport):
     def __init__(self):
         self._transport = httpx.AsyncHTTPTransport()
-
         self._breaker = CircuitBreaker(
             fail_max=5,
             timeout_duration=timedelta(seconds=30),
@@ -25,17 +24,33 @@ class ResilientTransport(httpx.AsyncBaseTransport):
         wait=wait_exponential(multiplier=1, min=1, max=8),
         reraise=True,
     )
-    async def _execute(self, request: httpx.Request):
-        return await self._breaker.call_async(
-            self._transport.handle_async_request,
-            request,
-        )
+    async def _retry_execute(self, request: httpx.Request) -> httpx.Response:
+        # No breaker logic here. This just absorbs transient failures.
+        # The breaker only sees the outcome after retries are exhausted.
+        return await self._transport.handle_async_request(request)
 
     async def handle_async_request(
         self,
         request: httpx.Request,
     ) -> httpx.Response:
-        return await self._execute(request)
+        # Breaker wraps retry: if open, fails fast (no wasted retries).
+        # If closed, the retry loop runs to completion and exactly one
+        # success/failure is recorded against the breaker's fail_max.
+        return await self._breaker.call_async(self._retry_execute, request)
 
     async def aclose(self):
         await self._transport.aclose()
+
+
+client = httpx.AsyncClient(
+    transport=ResilientTransport(),
+    timeout=30,
+)
+
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(
+    model="gpt-4.1",
+    api_key="...",
+    http_async_client=client,
+)
