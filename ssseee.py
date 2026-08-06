@@ -1,10 +1,10 @@
 import asyncio
+import contextvars
 import json
-import uuid
 from typing import (
     AsyncIterator,
+    Optional,
     Protocol,
-    Callable,
 )
 
 from fastapi import FastAPI, APIRouter
@@ -13,61 +13,150 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# DOMAIN MODELS
-# ============================================================
-
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-
-
-# ============================================================
 # PORTS
 # ============================================================
 
 class ChatEventsPort(Protocol):
-    """
-    Application output port.
-    The application emits chat events here.
-    """
 
-    async def token(
-        self,
-        value: str,
-    ) -> None:
+    async def token(self, value: str) -> None:
         ...
 
-
-    async def final(
-        self,
-        value: str,
-    ) -> None:
+    async def final(self, value: str) -> None:
         ...
 
-
-    async def error(
-        self,
-        value: str,
-    ) -> None:
+    async def error(self, value: str) -> None:
         ...
 
-
-    async def complete(
-        self,
-    ) -> None:
+    async def complete(self) -> None:
         ...
-
 
 
 class AgentPort(Protocol):
 
     async def run(
         self,
-        state: AgentState,
+        state,
         config: dict,
-    ) -> AgentState:
+    ):
         ...
+
+
+# ============================================================
+# CALLBACK BRIDGE
+#
+# This is passed to build_agent()
+#
+# ============================================================
+
+_current_events: contextvars.ContextVar[
+    Optional[ChatEventsPort]
+] = contextvars.ContextVar(
+    "current_events",
+    default=None,
+)
+
+
+async def on_token(token: str):
+
+    events = _current_events.get()
+
+    if events:
+        await events.token(token)
+
+
+
+# ============================================================
+# OUTBOUND ADAPTER
+#
+# Queue implementation of ChatEventsPort
+#
+# ============================================================
+
+class SSEQueueAdapter(ChatEventsPort):
+
+    def __init__(self):
+
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+
+    async def token(
+        self,
+        value: str,
+    ):
+
+        await self.queue.put(
+            {
+                "type": "token",
+                "value": value,
+            }
+        )
+
+
+    async def final(
+        self,
+        value: str,
+    ):
+
+        await self.queue.put(
+            {
+                "type": "final",
+                "value": value,
+            }
+        )
+
+
+    async def error(
+        self,
+        value: str,
+    ):
+
+        await self.queue.put(
+            {
+                "type": "error",
+                "value": value,
+            }
+        )
+
+
+    async def complete(self):
+
+        await self.queue.put(
+            {
+                "type": "complete"
+            }
+        )
+
+
+
+# ============================================================
+# OUTBOUND ADAPTER
+#
+# LangGraph implementation of AgentPort
+#
+# ============================================================
+
+class LangGraphAgentAdapter(AgentPort):
+
+    def __init__(
+        self,
+        graph,
+    ):
+
+        self.graph = graph
+
+
+    async def run(
+        self,
+        state,
+        config: dict,
+    ):
+
+        result = await self.graph.ainvoke(
+            _pack(state),
+            config=config,
+        )
+
+        return _unpack(result)
 
 
 
@@ -95,10 +184,12 @@ class StreamChatUseCase:
         message: str,
     ):
 
-
         state = AgentState(
             session_id=session_id,
         )
+
+
+        state.iteration = 0
 
 
         state.conversation.append(
@@ -111,21 +202,27 @@ class StreamChatUseCase:
 
         config = {
             "configurable": {
-                "thread_id": session_id
+                "thread_id": session_id,
             }
         }
 
 
+        # Bind this request's event stream
+        context_token = _current_events.set(
+            self.events
+        )
+
+
         try:
 
-            result = await self.agent.run(
+            final_state = await self.agent.run(
                 state,
                 config,
             )
 
 
             await self.events.final(
-                result.final_answer
+                final_state.final_answer
             )
 
 
@@ -138,135 +235,11 @@ class StreamChatUseCase:
 
         finally:
 
+            _current_events.reset(
+                context_token
+            )
+
             await self.events.complete()
-
-
-
-# ============================================================
-# OUTBOUND ADAPTER
-# Queue implementation of ChatEventsPort
-# ============================================================
-
-class SSEQueueAdapter(ChatEventsPort):
-
-
-    def __init__(self):
-
-        self.queue: asyncio.Queue = asyncio.Queue()
-
-
-
-    async def token(
-        self,
-        value: str,
-    ):
-
-        await self.queue.put(
-            {
-                "type": "token",
-                "value": value,
-            }
-        )
-
-
-
-    async def final(
-        self,
-        value: str,
-    ):
-
-        await self.queue.put(
-            {
-                "type": "final",
-                "value": value,
-            }
-        )
-
-
-
-    async def error(
-        self,
-        value: str,
-    ):
-
-        await self.queue.put(
-            {
-                "type": "error",
-                "value": value,
-            }
-        )
-
-
-
-    async def complete(
-        self,
-    ):
-
-        await self.queue.put(
-            {
-                "type": "complete"
-            }
-        )
-
-
-
-# ============================================================
-# LANGGRAPH OUTBOUND ADAPTER
-# ============================================================
-
-class LangGraphAgentAdapter(AgentPort):
-
-
-    def __init__(
-        self,
-        graph,
-    ):
-
-        self.graph = graph
-
-
-
-    async def run(
-        self,
-        state: AgentState,
-        config: dict,
-    ) -> AgentState:
-
-
-        result = await self.graph.ainvoke(
-            _pack(state),
-            config=config,
-        )
-
-
-        return _unpack(result)
-
-
-
-# ============================================================
-# LANGGRAPH CALLBACK ADAPTER
-# ============================================================
-
-class TokenCallbackAdapter:
-
-
-    def __init__(
-        self,
-        events: ChatEventsPort,
-    ):
-
-        self.events = events
-
-
-
-    async def __call__(
-        self,
-        token: str,
-    ):
-
-        await self.events.token(
-            token
-        )
 
 
 
@@ -306,17 +279,18 @@ class ChatController:
 
         asyncio.create_task(
             use_case.execute(
-                session_id,
-                message,
+                session_id=session_id,
+                message=message,
             )
         )
 
 
-        async def event_stream():
+
+        async def event_generator()
+            -> AsyncIterator[str]:
 
 
             while True:
-
 
                 event = await events.queue.get()
 
@@ -332,16 +306,39 @@ class ChatController:
 
 
 
-                yield (
-                    f"event: {event['type']}\n"
-                    f"data: {json.dumps(event)}\n\n"
-                )
+                if event["type"] == "token":
+
+                    yield (
+                        "event: token\n"
+                        f"data: {json.dumps({'token': event['value']})}\n\n"
+                    )
+
+
+                elif event["type"] == "final":
+
+                    yield (
+                        "event: final\n"
+                        f"data: {json.dumps({'answer': event['value']})}\n\n"
+                    )
+
+
+                elif event["type"] == "error":
+
+                    yield (
+                        "event: error\n"
+                        f"data: {json.dumps({'message': event['value']})}\n\n"
+                    )
 
 
 
         return StreamingResponse(
-            event_stream(),
+            event_generator(),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
 
@@ -349,6 +346,13 @@ class ChatController:
 # ============================================================
 # ROUTER
 # ============================================================
+
+class ChatRequest(BaseModel):
+
+    session_id: str
+    message: str
+
+
 
 def create_chat_router(
     graph,
@@ -386,33 +390,49 @@ app = FastAPI()
 
 
 
-# Your lifespan:
+# ============================================================
+# YOUR EXISTING LIFESPAN
+# ============================================================
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
 
     container = Container()
 
-    ...
+    await container.boot
 
 
-    #
-    # Create event adapter
-    #
+    # ------------------------------
+    # Your existing setup
+    # ------------------------------
 
-    events = SSEQueueAdapter()
-
-
-    #
-    # Create callback adapter
-    #
-
-    callback = TokenCallbackAdapter(
-        events
+    llm = ChatOpenAI(
+        base_url="http://nautilus:1234/v1",
+        api_key="lm_studio",
+        model="mistralai/ministral-3-3b",
+        http_async_client=client,
     )
 
 
-    #
-    # Keep your build_agent contract
+    tool_registry = ToolRegistry(
+        [
+            SQLToolCapability(
+                sqlite_repository,
+                SQLHandlerFactory(),
+            ),
+            PythonToolCapability(
+                SafeCodeFactory()
+            ),
+        ]
+    )
+
+
+    checkpointer = MemorySaver()
+
+
+
+    # IMPORTANT:
+    # keep your build_agent exactly
     #
 
     graph, _ = build_agent(
@@ -420,7 +440,7 @@ async def lifespan(app: FastAPI):
         tool_registry=tool_registry,
         checkpointer=checkpointer,
         use_streaming=True,
-        on_token=callback,
+        on_token=on_token,
     )
 
 
@@ -436,8 +456,10 @@ app = FastAPI(
 )
 
 
-app.include_router(
-    create_chat_router(
-        app.state.graph
-    )
-)
+# after startup:
+#
+# app.include_router(
+#     create_chat_router(
+#         app.state.graph
+#     )
+# )
